@@ -103,7 +103,9 @@ class Runner::RunnerImpl {
                  int                                       n_predict,
                  const text_callback_t &                   text_callback,
                  const audio_callback_t &                  audio_callback,
-                 const std::vector<mtmd_output_modality> & modalities) {
+                 const std::vector<mtmd_output_modality> & modalities,
+                 const std::vector<common_chat_tool> &     tools,
+                 bool                                      special_tokens) {
         const bool audio_output_supported = mtmd_support_audio_output(ctx.mtmd_ctx_audio.get());
         if (audio_output_supported) {
             mtmd_set_output_modalities(ctx.mtmd_ctx_audio.get(), modalities.data(), modalities.size());
@@ -140,14 +142,18 @@ class Runner::RunnerImpl {
             }
             // push msg
             common_chat_msg msg;
-            msg.role    = message.role;
-            msg.content = message.content;
+            msg.role         = message.role;
+            msg.content      = message.content;
+            msg.tool_calls   = message.tool_calls;
+            msg.tool_call_id = message.tool_call_id;
+            msg.tool_name    = message.tool_name;
             msgs.push_back(msg);
         }
 
-        if (eval_messages(msgs, ctx.n_past == 0)) {
+        if (eval_messages(msgs, ctx.n_past == 0, tools)) {
             return error("failed to run prefill");
         }
+        render_special_tokens = special_tokens;
 
         // inject perf measurement here
         auto text_callback_perf = [&](const std::string & text) {
@@ -243,6 +249,9 @@ class Runner::RunnerImpl {
     // continuation prefill (see eval_messages()).
     llama_token pending_eot = LLAMA_TOKEN_NULL;
 
+    // Whether special tokens are rendered into the streamed text (per request, see generate()).
+    bool render_special_tokens = false;
+
     // perf
     size_t                 text_tokens_count = 0, audio_samples_count = 0;
     std::optional<int64_t> first_text_received, first_audio_received;
@@ -288,7 +297,10 @@ class Runner::RunnerImpl {
                 }
 
                 // output
-                if (auto token_str = common_token_to_piece(ctx.lctx, next_text_token, false); !token_str.empty()) {
+                // Protocol tokens (<|tool_call_start|>, <|text_end|>, …) reach the client only on request:
+                // a tool-calling client needs them to read the call block, a plain chat client does not.
+                if (auto token_str = common_token_to_piece(ctx.lctx, next_text_token, render_special_tokens);
+                    !token_str.empty()) {
                     text_callback(token_str);
                     LOG("%s", token_str.c_str());
                     fflush(stdout);
@@ -332,9 +344,11 @@ class Runner::RunnerImpl {
         audio_samples_count  = 0;
     }
 
-    int eval_messages(const std::vector<common_chat_msg> & msgs, bool add_bos = false) {
+    int eval_messages(const std::vector<common_chat_msg> & msgs, bool add_bos = false,
+                      const std::vector<common_chat_tool> & tools = {}) {
         common_chat_templates_inputs tmpl_inputs;
         tmpl_inputs.messages              = msgs;
+        tmpl_inputs.tools                 = tools;  // the template renders the list (LFM2: in the system prompt)
         tmpl_inputs.add_generation_prompt = true;
         auto formatted_chat               = common_chat_templates_apply(ctx.tmpls.get(), tmpl_inputs);
 
@@ -416,8 +430,10 @@ int Runner::generate(const std::vector<Message> &              messages,
                      int                                       n_predict,
                      const text_callback_t &                   text_callback,
                      const audio_callback_t &                  audio_callback,
-                     const std::vector<mtmd_output_modality> & modalities) {
-    return impl_->generate(messages, n_predict, text_callback, audio_callback, modalities);
+                     const std::vector<mtmd_output_modality> & modalities,
+                     const std::vector<common_chat_tool> &     tools,
+                     bool                                      special_tokens) {
+    return impl_->generate(messages, n_predict, text_callback, audio_callback, modalities, tools, special_tokens);
 }
 
 int Runner::init(common_params params) {

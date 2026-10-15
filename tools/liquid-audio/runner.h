@@ -1,5 +1,6 @@
 #pragma once
 
+#include "chat.h"
 #include "common.h"
 #include "mtmd.h"
 
@@ -29,6 +30,10 @@ class Runner {
         std::string            role;
         std::string            content;
         std::vector<std::byte> wav;
+        // assistant and tool turns, as the OpenAI API carries them; rendered by the chat template
+        std::vector<common_chat_tool_call> tool_calls;
+        std::string                        tool_call_id;
+        std::string                        tool_name;
     };
 
     Runner();
@@ -42,7 +47,9 @@ class Runner {
                   int                                       n_predict,
                   const text_callback_t &                   text_callback,
                   const audio_callback_t &                  audio_callback,
-                  const std::vector<mtmd_output_modality> & modalities);
+                  const std::vector<mtmd_output_modality> & modalities,
+                  const std::vector<common_chat_tool> &     tools          = {},
+                  bool                                      special_tokens = false);
 
     int          get_output_sample_rate() const;
     const char * get_last_error() const;
