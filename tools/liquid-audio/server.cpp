@@ -97,6 +97,8 @@ struct OutputBuffer {
 struct WorkItem {
     std::vector<liquid::audio::Runner::Message> messages;
     std::vector<mtmd_output_modality>           modalities;
+    std::vector<common_chat_tool>               tools;
+    bool                                        special_tokens;
     int                                         n_predict;
     bool                                        reset_context;
     std::shared_ptr<OutputBuffer>               output;
@@ -234,7 +236,8 @@ int main(int argc, char ** argv) {
             };
 
             std::optional<std::string> err;
-            if (runner.generate(item.messages, item.n_predict, text_cb, audio_cb, item.modalities)) {
+            if (runner.generate(item.messages, item.n_predict, text_cb, audio_cb, item.modalities, item.tools,
+                                item.special_tokens)) {
                 err = runner.get_last_error();
             }
 
@@ -316,9 +319,24 @@ int main(int argc, char ** argv) {
             int  n_predict     = body.value("max_tokens", 2048);
             bool stream        = body.value("stream", false);
             bool reset_context = body.value("reset_context", true);
+            // Stream the special tokens the model writes (tool-call markers, <|text_end|>…); off by default.
+            bool special_tokens = body.value("return_special_tokens", false);
 
             std::vector<liquid::audio::Runner::Message> messages;
             std::vector<mtmd_output_modality>           modalities;
+            std::vector<common_chat_tool>               tools;
+
+            // OpenAI-style tool list: {"type": "function", "function": {name, description, parameters}}
+            if (body.contains("tools") && body.at("tools").is_array()) {
+                for (const auto & item : body.at("tools")) {
+                    const json &     fn = item.contains("function") ? item.at("function") : item;
+                    common_chat_tool tool;
+                    tool.name        = fn.value("name", "");
+                    tool.description = fn.value("description", "");
+                    tool.parameters  = fn.contains("parameters") ? fn.at("parameters").dump() : "{}";
+                    tools.push_back(std::move(tool));
+                }
+            }
 
             if (body.contains("modalities") && body.at("modalities").is_array()) {
                 for (const auto & modality : body.at("modalities")) {
@@ -333,15 +351,51 @@ int main(int argc, char ** argv) {
             if (body.contains("messages") && body["messages"].is_array()) {
                 for (const auto & msg : body["messages"]) {
                     std::string role    = msg["role"];
-                    auto        content = msg["content"];
+                    json        content = msg.contains("content") ? msg["content"] : json();
 
                     if (role == "system") {
                         messages.push_back({ role, content, {} });
                         continue;
                     }
 
+                    // assistant and tool turns replay a dialogue (earlier decisions, tool results);
+                    // the chat template renders them, including the tool-result markers
+                    if (role == "assistant" || role == "tool") {
+                        liquid::audio::Runner::Message turn;
+                        turn.role = role;
+                        if (content.is_string()) {
+                            turn.content = content.get<std::string>();
+                        } else if (content.is_array()) {
+                            for (const auto & part : content) {
+                                if (part.value("type", "") == "text") {
+                                    turn.content += part.value("text", "");
+                                }
+                            }
+                        } else if (!content.is_null()) {
+                            turn.content = content.dump();
+                        }
+                        if (role == "assistant" && msg.contains("tool_calls") && msg["tool_calls"].is_array()) {
+                            for (const auto & call : msg["tool_calls"]) {
+                                const json &          fn = call.contains("function") ? call.at("function") : call;
+                                common_chat_tool_call tc;
+                                tc.id        = call.value("id", "");
+                                tc.name      = fn.value("name", "");
+                                tc.arguments = fn.contains("arguments") && fn.at("arguments").is_string()
+                                                   ? fn.at("arguments").get<std::string>()
+                                                   : (fn.contains("arguments") ? fn.at("arguments").dump() : "{}");
+                                turn.tool_calls.push_back(std::move(tc));
+                            }
+                        }
+                        if (role == "tool") {
+                            turn.tool_call_id = msg.value("tool_call_id", "");
+                            turn.tool_name    = msg.value("name", "");
+                        }
+                        messages.push_back(std::move(turn));
+                        continue;
+                    }
+
                     if (role != "user") {
-                        res_error(res, "role must be system or user", 400);
+                        res_error(res, "role must be system, user, assistant or tool", 400);
                         return;
                     }
 
@@ -407,6 +461,8 @@ int main(int argc, char ** argv) {
             work_queue.push({
                 std::move(messages),
                 std::move(modalities),
+                std::move(tools),
+                special_tokens,
                 n_predict,
                 reset_context,
                 output,
